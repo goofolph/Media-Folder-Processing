@@ -1,8 +1,11 @@
 import mimetypes
+import traceback
 import platform
 import tkinter as tk
+from tkinter import messagebox
 from tkinter import ttk
 import os
+import shutil
 
 import mpv
 
@@ -37,8 +40,9 @@ class MediaApp:
         self.video_frame = tk.Frame(self.paned, bg='black', width=640, height=480)
         self.paned.add(self.video_frame, weight=1)
 
-        # Track the current player so we can stop it before playing a new file
-        self.current_player = None
+        # Track the player (single reusable instance)
+        self.player = None
+        self.current_video_path = None
 
         self.folder_icon = tk.PhotoImage(width=16, height=16)
         self.folder_icon.put(
@@ -64,8 +68,11 @@ class MediaApp:
         self.tree_menu.add_command(
             label='Open folder', command=self._open_selected_folder
         )
-        self.tree_menu.add_separator()
         self.tree_menu.add_command(label='Copy path', command=self._copy_selected_path)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(
+            label='Delete', command=self._delete_selected, foreground='red'
+        )
 
         # Create video frame context menu
         self.video_menu = tk.Menu(self.video_frame, tearoff=0)
@@ -76,14 +83,91 @@ class MediaApp:
         # Bind right-click on video frame to context menu
         self.video_frame.bind('<Button-3>', self._on_video_context)
 
+        # Terminate mpv and let Tk handle the destroy (default is also destroy)
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        # Register X11 error handler to ignore BadWindow/RenderBadPicture protocol errors
+        self._register_x11_error_handler()
+
+        # Ensure the widget has been realized before creating MPV
+        self.video_frame.pack_propagate(False)
+        self.root.update()
+
+        try:
+            # Force the x11 video output backend on Linux to ensure stable window embedding with Tkinter
+            if platform.system() == 'Linux':
+                self.player = mpv.MPV(wid=str(self.video_frame.winfo_id()), vo='x11')
+            else:
+                self.player = mpv.MPV(wid=str(self.video_frame.winfo_id()))
+        except Exception as e:
+            messagebox.showerror('Player Error', f'Failed to initialize mpv player:\n{e}')
+
+        # Media controls via keyboard
+        def toggle_pause(ev):
+            if self.current_video_path and self.player:
+                self.player.pause = not self.player.pause
+
+        def seek_forward(ev):
+            if self.current_video_path and self.player:
+                try:
+                    self.player.seek(5, reference='relative')
+                except SystemError:
+                    pass
+
+        def seek_backward(ev):
+            if self.current_video_path and self.player:
+                try:
+                    self.player.seek(-5, reference='relative')
+                except SystemError:
+                    pass
+
+        # Bind media keys on video frame (not root, so they don't collide)
+        self.video_frame.bind('<space>', toggle_pause)
+        self.video_frame.bind('<Right>', seek_forward)
+        self.video_frame.bind('<Left>', seek_backward)
+        self.video_frame.bind('<Escape>', self._on_escape)
+
         # Load initial root directory (Change this path to test different folders)
+        self._initial_dirs = []
         for d in dirs:
             root_path = os.path.abspath(d)  # Defaults to system root (e.g., C:\ or /)
-            self.insert_node('', d, os.path.basename(root_path))
+            self._initial_dirs.append(root_path)
+            self.insert_node('', root_path, os.path.basename(root_path))
 
-    def insert_node(self, parent, path, text):
+    def _register_x11_error_handler(self):
+        """Register a custom X11 error handler to ignore non-fatal protocol errors like BadWindow or RenderBadPicture."""
+        if platform.system() == 'Linux':
+            try:
+                import ctypes
+                from ctypes import c_int, c_void_p, POINTER, Structure, c_ulong, c_ubyte
+
+                class XErrorEvent(Structure):
+                    _fields_ = [
+                        ('type', c_int),
+                        ('display', c_void_p),
+                        ('serial', c_ulong),
+                        ('error_code', c_ubyte),
+                        ('request_code', c_ubyte),
+                        ('minor_code', c_ubyte),
+                        ('resourceid', c_ulong),
+                    ]
+
+                def _x_error_handler(display, error_event_ptr):
+                    # Ignore non-fatal X11 protocol errors (BadWindow, RenderBadPicture, etc.)
+                    return 0
+
+                self._x_handler_type = ctypes.CFUNCTYPE(c_int, c_void_p, POINTER(XErrorEvent))
+                self._x_handler = self._x_handler_type(_x_error_handler)
+
+                xlib = ctypes.cdll.LoadLibrary('libX11.so.6')
+                xlib.XSetErrorHandler(self._x_handler)
+            except Exception:
+                pass
+
+    def insert_node(self, parent, path, text, is_dir=None):
         """Inserts a node into the tree. If it's a folder, adds a dummy child."""
-        is_dir = os.path.isdir(path)
+        if is_dir is None:
+            is_dir = os.path.isdir(path)
         icon = self.folder_icon if is_dir else self.file_icon
 
         # Insert the item
@@ -91,13 +175,7 @@ class MediaApp:
 
         # If it's a directory, add a dummy child so the UI displays the expand arrow
         if is_dir:
-            try:
-                # Check if directory is empty; if not, add placeholder
-                if os.listdir(path):
-                    self.tree.insert(node, 'end', text='loading...')
-            except PermissionError:
-                # Handle folders we don't have permission to read
-                pass
+            self.tree.insert(node, 'end', text='loading...')
 
     def on_expand(self, event):
         """Triggered when a user clicks the expand arrow."""
@@ -114,11 +192,25 @@ class MediaApp:
             self.tree.delete(children[0])
 
             try:
-                # Loop through the actual directory contents and insert them
-                for item in sorted(os.listdir(path), key=lambda s: s.lower()):
-                    full_path = os.path.join(path, item)
-                    if is_video_file(full_path) or os.path.isdir(full_path):
-                        self.insert_node(node, full_path, item)
+                # Use os.scandir for fast, stat-efficient directory scanning
+                entries = []
+                with os.scandir(path) as it:
+                    for entry in it:
+                        try:
+                            is_dir = entry.is_dir(follow_symlinks=True)
+                            is_file = entry.is_file(follow_symlinks=True)
+                        except OSError:
+                            # Handle cases where the entry is broken/inaccessible
+                            continue
+
+                        if is_dir or (is_file and is_video_file(entry.path)):
+                            entries.append((entry.name.lower(), entry.name, entry.path, is_dir))
+
+                # Sort entries by name case-insensitively
+                entries.sort(key=lambda x: x[0])
+
+                for _, name, full_path, is_dir in entries:
+                    self.insert_node(node, full_path, name, is_dir=is_dir)
             except PermissionError:
                 # Insert a visual cue if access is denied
                 self.tree.insert(node, 'end', text='[Access Denied]', values=('',))
@@ -182,86 +274,133 @@ class MediaApp:
     def _copy_selected_path(self):
         """Copy the selected item's path to the clipboard."""
         path = self._selected_path()
-        if path:
+        if not path:
+            return
+        try:
             self.root.clipboard_clear()
             self.root.clipboard_append(path)
             self.root.update()
+        except tk.TclError:
+            # Root window already destroyed — nothing to do.
+            pass
+
+    def _delete_selected(self):
+        """Delete the selected file or directory after confirmation."""
+        selection = self.tree.selection()
+        print(f'Deteting selected {selection}')
+        if not selection:
+            return
+        path = self._selected_path()
+        print(f'Deteting path {path}')
+        if not path:
+            return
+
+        # Confirm before mutating UI or disk
+        target = 'directory' if os.path.isdir(path) else 'file'
+        if not messagebox.askokcancel('Delete', f'Remove this {target}?\n\n{path}'):
+            return
+
+        node = selection[0]
+        print(f'Selected node {node}')
+
+        # Stop playback before disk deletion to release locks and avoid player crash states
+        if self.current_video_path:
+            current_abs = os.path.abspath(self.current_video_path)
+            target_abs = os.path.abspath(path)
+            is_same_or_child = False
+            if current_abs == target_abs:
+                is_same_or_child = True
+            elif os.path.isdir(target_abs):
+                try:
+                    is_same_or_child = (
+                        os.path.commonpath([target_abs, current_abs]) == target_abs
+                    )
+                except ValueError:
+                    pass
+            if is_same_or_child:
+                print('Stopping video')
+                self.play_video('')
+
+        try:
+            if os.path.isdir(path):
+                print(f'Delting directory {path}')
+                shutil.rmtree(path)
+            else:
+                print(f'Delting file {path}')
+                os.remove(path)
+        except (PermissionError, OSError) as exc:
+            # Disk deletion failed; leave the node so the UI matches reality
+            messagebox.showerror('Delete Failed', f'Failed to delete:\n{exc}')
+            return
+
+        # Remove from the tree only after disk deletion succeeds
+        print(f'Deleting node {node}')
+        self.tree.delete(node)
+
+    def _refresh_tree(self):
+        """Remove all items and reload the root directories."""
+        self.tree.delete(*self.tree.get_children())
+        for d in self._initial_dirs:
+            self.insert_node('', d, os.path.basename(os.path.abspath(d)))
 
     def _toggle_pause_video(self):
         """Pause/resume playback via context menu."""
-        if self.current_player is not None:
-            self.current_player.pause = not self.current_player.pause
+        if self.player is not None and self.current_video_path:
+            self.player.pause = not self.player.pause
 
     def _on_video_context(self, event):
         """Show video playback context menu."""
         self.video_menu.tk_popup(event.x_root, event.y_root)
 
     def _stop_video(self):
-        """Stop playback and release the player."""
-        self.play_video('')  # Clear the video
+        """Stop playback cleanly."""
+        self.current_video_path = None
+        if self.player is not None:
+            self.player.stop()
+
+    def _on_close(self):
+        """Handle window close: stop mpv, then destroy the root."""
+        if self.player is not None:
+            self.player.terminate()
+            self.player = None
+        self.root.destroy()
+
+    def _on_escape(self, event):
+        """Stop playback and release player on ESC key."""
+        self.play_video('')
 
     def play_video(self, video_path):
         """Load and play a video file embedded in the video_frame."""
-        # Stopping playback when called with empty string
-        if not video_path:
-            if self.current_player is not None:
-                self.current_player.terminate()
-                self.current_player = None
-            self.video_frame.unbind('<Space>')
-            self.video_frame.unbind('<Right>')
-            self.video_frame.unbind('<Left>')
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
             return
 
-        # Clean up any previous bindings before setting up new ones
-        self.video_frame.unbind('<Space>')
-        self.video_frame.unbind('<Right>')
-        self.video_frame.unbind('<Left>')
+        # Stopping playback when called with empty string
+        if not video_path:
+            self._stop_video()
+            return
 
-        # Stop any previously playing video to avoid overlapping playback
-        if self.current_player is not None:
-            self.current_player.terminate()
-            self.current_player = None
+        # Stop previous playback cleanly before starting new video
+        if self.player is not None:
+            self.player.stop()
 
-        self.video_frame.pack_propagate(False)
-        self.root.update()  # Ensure the widget has been realized
-
-        player = mpv.MPV(wid=str(self.video_frame.winfo_id()))
-
-        # Media controls via keyboard
-        def toggle_pause(ev):
-            """Pause/resume playback with spacebar."""
-            player.pause = not player.pause
-
-        def seek_forward(ev):
-            """Skip forward 5 seconds with right arrow."""
-            try:
-                player.seek(5, reference='relative')
-            except SystemError:
-                pass  # seek past end of file
-
-        def seek_backward(ev):
-            """Skip backward 5 seconds with left arrow."""
-            try:
-                player.seek(-5, reference='relative')
-            except SystemError:
-                pass  # seek past beginning of file
-
-        # Bind media keys on video frame (not root, so they don't collide)
-        self.video_frame.bind('<space>', toggle_pause)
-        self.video_frame.bind('<Right>', seek_forward)
-        self.video_frame.bind('<Left>', seek_backward)
-
-        # Focus the video frame so it receives key events
         self.video_frame.focus_set()
 
         # Load and play the video
-        player.play(video_path)
-        self.current_player = player
+        mpv_file_path = os.path.abspath(video_path)
+        self.current_video_path = mpv_file_path
+        if self.player is not None:
+            self.player.play(mpv_file_path)
 
 
 if __name__ == '__main__':
-    import sys
+    try:
+        import sys
 
-    root = tk.Tk()
-    MediaApp(root, sys.argv[1:])
-    root.mainloop()
+        root = tk.Tk()
+        MediaApp(root, sys.argv[1:])
+        root.mainloop()
+    except Exception:
+        traceback.print_exc()
